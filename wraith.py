@@ -22,9 +22,17 @@ import os
 import subprocess
 import json
 import time
-import requests
 import argparse
 from datetime import datetime
+
+# Optional: requests for GitHub API
+try:
+    import requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
+    print("⚠️  'requests' library not found. GitHub API features disabled.")
+    print("   Install with: pip install requests\n")
 
 # ---------------------------------------------------------
 # CONFIGURATION
@@ -51,8 +59,572 @@ AVAILABLE_MODULES = {
     'issue_references': 'Issues mentioned in commits',
 }
 
-# [Previous helper functions remain the same: run_git_command, get_repo_info, etc.]
-# ... [Include all the helper functions from before]
+# ---------------------------------------------------------
+# GIT OPERATIONS
+# ---------------------------------------------------------
+
+def run_git_command(cmd):
+    """Execute git command and return output."""
+    try:
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='ignore'
+        )
+        return result.stdout.strip()
+    except Exception as e:
+        return f"ERROR: {e}"
+
+def get_repo_info():
+    """Get basic repository information."""
+    repo_url = run_git_command("git config --get remote.origin.url")
+    current_branch = run_git_command("git branch --show-current")
+    total_commits = run_git_command("git rev-list --count HEAD")
+    first_commit_date = run_git_command('git log --reverse --format="%ai" | head -1')
+    last_commit_date = run_git_command('git log -1 --format="%ai"')
+    
+    # Parse GitHub owner/repo from URL
+    owner, repo = parse_github_url(repo_url)
+    
+    return {
+        'repo_url': repo_url,
+        'owner': owner,
+        'repo': repo,
+        'branch': current_branch,
+        'total_commits': total_commits,
+        'first_commit': first_commit_date,
+        'last_commit': last_commit_date
+    }
+
+def parse_github_url(url):
+    """Extract owner and repo name from GitHub URL."""
+    if not url:
+        return None, None
+    
+    # Handle different URL formats
+    url = url.replace('.git', '')
+    
+    if 'github.com' in url:
+        parts = url.split('github.com/')[-1].split('/')
+        if len(parts) >= 2:
+            return parts[0], parts[1]
+    
+    return None, None
+
+def get_contributors():
+    """Get list of all contributors with commit counts."""
+    contributors_raw = run_git_command('git shortlog -sne --all')
+    contributors = []
+    
+    for line in contributors_raw.split('\n'):
+        if line.strip():
+            parts = line.strip().split('\t')
+            if len(parts) == 2:
+                count = parts[0].strip()
+                author_info = parts[1]
+                contributors.append({
+                    'count': count,
+                    'info': author_info
+                })
+    
+    return contributors
+
+def get_branches():
+    """Get information about branches."""
+    branches_raw = run_git_command('git branch -a -v')
+    branches = []
+    
+    for line in branches_raw.split('\n'):
+        if line.strip():
+            branches.append(line.strip())
+    
+    return branches
+
+def get_tags():
+    """Get all tags with associated commits."""
+    tags_raw = run_git_command('git tag -l --format="%(refname:short)|%(objectname:short)|%(creatordate:short)|%(subject)"')
+    tags = []
+    
+    for line in tags_raw.split('\n'):
+        if line.strip():
+            parts = line.split('|')
+            if len(parts) >= 2:
+                tags.append({
+                    'name': parts[0],
+                    'hash': parts[1],
+                    'date': parts[2] if len(parts) > 2 else '',
+                    'subject': parts[3] if len(parts) > 3 else ''
+                })
+    
+    return tags
+
+def get_all_commits(branch='HEAD', limit=None):
+    """Get list of all commit hashes."""
+    limit_flag = f'-n {limit}' if limit else ''
+    commits = run_git_command(f'git log {limit_flag} --format="%H" {branch}')
+    return commits.split('\n') if commits else []
+
+def get_commit_details(commit_hash, include_stats=True, include_files=True, include_diff=False):
+    """Get detailed information for a specific commit."""
+    
+    # Basic commit info
+    author = run_git_command(f'git show -s --format="%an" {commit_hash}')
+    author_email = run_git_command(f'git show -s --format="%ae" {commit_hash}')
+    date = run_git_command(f'git show -s --format="%ai" {commit_hash}')
+    subject = run_git_command(f'git show -s --format="%s" {commit_hash}')
+    body = run_git_command(f'git show -s --format="%b" {commit_hash}')
+    
+    details = {
+        'hash': commit_hash,
+        'short_hash': commit_hash[:7],
+        'author': author,
+        'email': author_email,
+        'date': date,
+        'subject': subject,
+        'body': body.strip() if body else '',
+    }
+    
+    # Get parent commits (for merge commits)
+    parents = run_git_command(f'git show -s --format="%P" {commit_hash}').split()
+    details['parents'] = parents
+    details['is_merge'] = len(parents) > 1
+    
+    # Extract PR number from commit message
+    import re
+    pr_match = re.search(r'#(\d+)', subject)
+    details['pr_number'] = pr_match.group(1) if pr_match else None
+    
+    # Extract issue references
+    issue_matches = re.findall(r'#(\d+)', subject + ' ' + body)
+    details['issue_refs'] = list(set(issue_matches)) if issue_matches else []
+    
+    # Optional: Get commit stats
+    if include_stats:
+        stats = run_git_command(f'git show --stat --format="" {commit_hash}')
+        details['stats'] = stats
+    
+    # Optional: Get file changes
+    if include_files:
+        files_changed = run_git_command(f'git show --name-status --format="" {commit_hash}')
+        details['files'] = parse_file_changes(files_changed)
+    
+    # Optional: Get full diff
+    if include_diff:
+        diff = run_git_command(f'git show {commit_hash}')
+        details['diff'] = diff
+    
+    return details
+
+def parse_file_changes(files_raw):
+    """Parse file changes into structured format."""
+    changes = []
+    
+    for line in files_raw.split('\n'):
+        if line.strip():
+            parts = line.split('\t')
+            if len(parts) >= 2:
+                status = parts[0]
+                filepath = parts[1]
+                changes.append({
+                    'status': status[0],
+                    'path': filepath
+                })
+    
+    return changes
+
+# ---------------------------------------------------------
+# GITHUB API OPERATIONS
+# ---------------------------------------------------------
+
+def github_api_request(endpoint, params=None):
+    """Make GitHub API request."""
+    if not HAS_REQUESTS:
+        return None
+    
+    if not GITHUB_TOKEN:
+        return None
+    
+    headers = {
+        'Authorization': f'token {GITHUB_TOKEN}',
+        'Accept': 'application/vnd.github.v3+json'
+    }
+    
+    try:
+        response = requests.get(f"{GITHUB_API}{endpoint}", headers=headers, params=params)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            print(f"GitHub API Error: {response.status_code} - {endpoint}")
+            return None
+    except Exception as e:
+        print(f"GitHub API Exception: {e}")
+        return None
+
+def get_pull_requests(owner, repo):
+    """Get all pull requests from GitHub."""
+    if not owner or not repo:
+        return []
+    
+    prs = []
+    page = 1
+    
+    while True:
+        data = github_api_request(f"/repos/{owner}/{repo}/pulls", {
+            'state': 'all',
+            'per_page': 100,
+            'page': page
+        })
+        
+        if not data:
+            break
+        
+        prs.extend(data)
+        
+        if len(data) < 100:
+            break
+        
+        page += 1
+    
+    return prs
+
+def get_pr_reviews(owner, repo, pr_number):
+    """Get reviews for a specific PR."""
+    if not owner or not repo:
+        return []
+    
+    return github_api_request(f"/repos/{owner}/{repo}/pulls/{pr_number}/reviews") or []
+
+def get_pr_comments(owner, repo, pr_number):
+    """Get review comments for a specific PR."""
+    if not owner or not repo:
+        return []
+    
+    return github_api_request(f"/repos/{owner}/{repo}/pulls/{pr_number}/comments") or []
+
+def get_issue_info(owner, repo, issue_number):
+    """Get information about a specific issue."""
+    if not owner or not repo:
+        return None
+    
+    return github_api_request(f"/repos/{owner}/{repo}/issues/{issue_number}")
+
+# ---------------------------------------------------------
+# HUMAN-READABLE FORMAT
+# ---------------------------------------------------------
+
+def generate_human_readable(data):
+    """Generate human-friendly markdown document."""
+    output = []
+    
+    # Header
+    output.append("# 📚 Git & GitHub History")
+    output.append(f"\n**Generated:** {time.strftime('%B %d, %Y at %I:%M %p')}")
+    if data.get('repo_info'):
+        output.append(f"**Repository:** [{data['repo_info']['owner']}/{data['repo_info']['repo']}]({data['repo_info']['repo_url']})")
+        output.append(f"**Branch:** `{data['repo_info']['branch']}`")
+        output.append(f"**Total Commits:** {data['repo_info']['total_commits']}\n")
+    output.append("---\n")
+    
+    # Table of Contents
+    output.append("## 📑 Table of Contents\n")
+    toc_num = 1
+    if data.get('repo_info'):
+        output.append(f"{toc_num}. [Repository Overview](#repository-overview)")
+        toc_num += 1
+    if data.get('contributors'):
+        output.append(f"{toc_num}. [Contributors](#contributors)")
+        toc_num += 1
+    if data.get('branches'):
+        output.append(f"{toc_num}. [Branches](#branches)")
+        toc_num += 1
+    if data.get('tags'):
+        output.append(f"{toc_num}. [Tags](#tags)")
+        toc_num += 1
+    if data.get('pull_requests'):
+        output.append(f"{toc_num}. [Pull Requests](#pull-requests)")
+        toc_num += 1
+    if data.get('commits'):
+        output.append(f"{toc_num}. [Commit History](#commit-history)")
+        toc_num += 1
+    output.append("\n---\n")
+    
+    # Repository Overview
+    if data.get('repo_info'):
+        info = data['repo_info']
+        output.append("## 📊 Repository Overview\n")
+        output.append(f"- **Repository URL:** {info['repo_url']}")
+        output.append(f"- **Current Branch:** {info['branch']}")
+        output.append(f"- **Total Commits:** {info['total_commits']}")
+        output.append(f"- **First Commit:** {info['first_commit']}")
+        output.append(f"- **Last Commit:** {info['last_commit']}\n")
+    
+    # Contributors
+    if data.get('contributors'):
+        output.append("## 👥 Contributors\n")
+        for contrib in data['contributors']:
+            output.append(f"- **{contrib['count']} commits** - {contrib['info']}")
+        output.append("")
+    
+    # Branches
+    if data.get('branches'):
+        output.append("## 🌿 Branches\n")
+        output.append("```")
+        for branch in data['branches']:
+            output.append(branch)
+        output.append("```\n")
+    
+    # Tags
+    if data.get('tags'):
+        output.append("## 🏷️ Tags\n")
+        for tag in data['tags']:
+            output.append(f"- **{tag['name']}** (`{tag['hash']}`) - {tag['date']}")
+            if tag.get('subject'):
+                output.append(f"  - {tag['subject']}")
+        output.append("")
+    
+    # Pull Requests
+    if data.get('pull_requests'):
+        output.append("## 🔀 Pull Requests\n")
+        
+        for pr in data['pull_requests']:
+            state_emoji = "✅" if pr['state'] == 'closed' and pr.get('merged_at') else "❌" if pr['state'] == 'closed' else "🔄"
+            output.append(f"### {state_emoji} PR #{pr['number']}: {pr['title']}")
+            output.append(f"**Author:** {pr['user']['login']}  ")
+            output.append(f"**State:** {pr['state']}  ")
+            output.append(f"**Created:** {pr['created_at'][:10]}  ")
+            
+            if pr.get('merged_at'):
+                output.append(f"**Merged:** {pr['merged_at'][:10]}  ")
+                if pr.get('merged_by'):
+                    output.append(f"**Merged By:** {pr['merged_by']['login']}  ")
+            
+            output.append(f"**Base:** `{pr['base']['ref']}` ← **Head:** `{pr['head']['ref']}`  ")
+            
+            if pr.get('body'):
+                output.append(f"\n**Description:**\n{pr['body'][:300]}{'...' if len(pr['body']) > 300 else ''}\n")
+            
+            # Reviews
+            if pr.get('reviews'):
+                output.append("\n**Reviews:**")
+                for review in pr['reviews']:
+                    state_icon = "✅" if review['state'] == 'APPROVED' else "❌" if review['state'] == 'CHANGES_REQUESTED' else "💬"
+                    output.append(f"- {state_icon} **{review['user']['login']}** - {review['state']} ({review['submitted_at'][:10]})")
+                    if review.get('body'):
+                        output.append(f"  > {review['body'][:150]}{'...' if len(review['body']) > 150 else ''}")
+                output.append("")
+            
+            # Comments
+            if pr.get('comments'):
+                output.append(f"\n**Review Comments:** ({len(pr['comments'])} comments)")
+                for comment in pr['comments'][:5]:  # Limit to first 5
+                    output.append(f"- **{comment['user']['login']}** on `{comment.get('path', 'N/A')}`")
+                    output.append(f"  > {comment['body'][:100]}{'...' if len(comment['body']) > 100 else ''}")
+                if len(pr['comments']) > 5:
+                    output.append(f"  *...and {len(pr['comments']) - 5} more comments*")
+                output.append("")
+            
+            output.append("---\n")
+    
+    # Commit History
+    if data.get('commits'):
+        output.append("## 📝 Commit History\n")
+        
+        for i, commit in enumerate(data['commits'], 1):
+            merge_icon = "🔀" if commit['is_merge'] else "📝"
+            output.append(f"### {merge_icon} Commit #{i}: {commit['subject']}")
+            output.append(f"**Hash:** `{commit['hash']}`  ")
+            output.append(f"**Author:** {commit['author']} <{commit['email']}>  ")
+            output.append(f"**Date:** {commit['date']}  ")
+            
+            if commit['is_merge']:
+                output.append(f"**Merge Commit** - Parents: {', '.join([p[:7] for p in commit['parents']])}  ")
+            
+            if commit.get('pr_number'):
+                output.append(f"**Pull Request:** #{commit['pr_number']}  ")
+            
+            if commit.get('issue_refs'):
+                output.append(f"**References Issues:** {', '.join(['#' + ref for ref in commit['issue_refs']])}  ")
+            
+            output.append("")
+            
+            if commit.get('body'):
+                output.append("**Message:**")
+                output.append("```")
+                output.append(commit['body'])
+                output.append("```\n")
+            
+            if commit.get('files'):
+                output.append("**Files Changed:**")
+                status_map = {'A': '✅ Added', 'M': '📝 Modified', 'D': '❌ Deleted', 'R': '🔄 Renamed'}
+                for file in commit['files']:
+                    status_icon = status_map.get(file['status'], file['status'])
+                    output.append(f"- {status_icon} `{file['path']}`")
+                output.append("")
+            
+            if commit.get('stats'):
+                output.append("<details><summary>Statistics</summary>\n")
+                output.append("```")
+                output.append(commit['stats'])
+                output.append("```")
+                output.append("</details>\n")
+            
+            if commit.get('diff'):
+                output.append("<details><summary>Full Diff</summary>\n")
+                output.append("```diff")
+                output.append(commit['diff'])
+                output.append("```")
+                output.append("</details>\n")
+            
+            output.append("---\n")
+    
+    return "\n".join(output)
+
+# ---------------------------------------------------------
+# AI-OPTIMIZED FORMAT
+# ---------------------------------------------------------
+
+def generate_ai_optimized(data):
+    """Generate AI-friendly flat structure."""
+    output = []
+    
+    # Header
+    output.append("AI_OPTIMIZED_GIT_HISTORY")
+    output.append(f"GENERATION_TIMESTAMP: {time.strftime('%Y-%m-%d_%H:%M:%S')}")
+    
+    if data.get('repo_info'):
+        info = data['repo_info']
+        output.append(f"REPO_URL: {info['repo_url']}")
+        output.append(f"REPO_OWNER: {info['owner']}")
+        output.append(f"REPO_NAME: {info['repo']}")
+        output.append(f"CURRENT_BRANCH: {info['branch']}")
+        output.append(f"TOTAL_COMMITS: {info['total_commits']}")
+        output.append(f"FIRST_COMMIT_DATE: {info['first_commit']}")
+        output.append(f"LAST_COMMIT_DATE: {info['last_commit']}")
+    
+    output.append("")
+    
+    # Contributors
+    if data.get('contributors'):
+        output.append("CONTRIBUTORS_START")
+        for contrib in data['contributors']:
+            output.append(f"CONTRIBUTOR|{contrib['count']}|{contrib['info']}")
+        output.append("CONTRIBUTORS_END")
+        output.append("")
+    
+    # Branches
+    if data.get('branches'):
+        output.append("BRANCHES_START")
+        for branch in data['branches']:
+            output.append(f"BRANCH|{branch}")
+        output.append("BRANCHES_END")
+        output.append("")
+    
+    # Tags
+    if data.get('tags'):
+        output.append("TAGS_START")
+        for tag in data['tags']:
+            output.append(f"TAG|{tag['name']}|{tag['hash']}|{tag['date']}|{tag.get('subject', '')}")
+        output.append("TAGS_END")
+        output.append("")
+    
+    # Pull Requests
+    if data.get('pull_requests'):
+        output.append("PULL_REQUESTS_START")
+        
+        for pr in data['pull_requests']:
+            output.append(f"PR_START|{pr['number']}")
+            output.append(f"PR_TITLE|{pr['title']}")
+            output.append(f"PR_AUTHOR|{pr['user']['login']}")
+            output.append(f"PR_STATE|{pr['state']}")
+            output.append(f"PR_CREATED|{pr['created_at']}")
+            output.append(f"PR_BASE|{pr['base']['ref']}")
+            output.append(f"PR_HEAD|{pr['head']['ref']}")
+            
+            if pr.get('merged_at'):
+                output.append(f"PR_MERGED|{pr['merged_at']}")
+                if pr.get('merged_by'):
+                    output.append(f"PR_MERGED_BY|{pr['merged_by']['login']}")
+            
+            if pr.get('body'):
+                output.append(f"PR_BODY_START")
+                output.append(pr['body'])
+                output.append(f"PR_BODY_END")
+            
+            # Reviews
+            if pr.get('reviews'):
+                output.append("PR_REVIEWS_START")
+                for review in pr['reviews']:
+                    output.append(f"REVIEW|{review['user']['login']}|{review['state']}|{review['submitted_at']}")
+                    if review.get('body'):
+                        output.append(f"REVIEW_BODY|{review['body']}")
+                output.append("PR_REVIEWS_END")
+            
+            # Comments
+            if pr.get('comments'):
+                output.append("PR_COMMENTS_START")
+                for comment in pr['comments']:
+                    output.append(f"COMMENT|{comment['user']['login']}|{comment.get('path', '')}|{comment.get('line', '')}")
+                    output.append(f"COMMENT_BODY|{comment['body']}")
+                output.append("PR_COMMENTS_END")
+            
+            output.append(f"PR_END|{pr['number']}")
+            output.append("")
+        
+        output.append("PULL_REQUESTS_END")
+        output.append("")
+    
+    # Commits
+    if data.get('commits'):
+        output.append("COMMITS_START")
+        
+        for commit in data['commits']:
+            output.append(f"COMMIT_START|{commit['hash']}")
+            output.append(f"COMMIT_SHORT_HASH|{commit['short_hash']}")
+            output.append(f"COMMIT_AUTHOR|{commit['author']}")
+            output.append(f"COMMIT_EMAIL|{commit['email']}")
+            output.append(f"COMMIT_DATE|{commit['date']}")
+            output.append(f"COMMIT_SUBJECT|{commit['subject']}")
+            output.append(f"COMMIT_IS_MERGE|{commit['is_merge']}")
+            
+            if commit['is_merge']:
+                output.append(f"COMMIT_PARENTS|{','.join(commit['parents'])}")
+            
+            if commit.get('pr_number'):
+                output.append(f"COMMIT_PR|{commit['pr_number']}")
+            
+            if commit.get('issue_refs'):
+                output.append(f"COMMIT_ISSUES|{','.join(commit['issue_refs'])}")
+            
+            if commit.get('body'):
+                output.append("COMMIT_BODY_START")
+                output.append(commit['body'])
+                output.append("COMMIT_BODY_END")
+            
+            if commit.get('files'):
+                output.append("COMMIT_FILES_START")
+                for file in commit['files']:
+                    output.append(f"FILE|{file['status']}|{file['path']}")
+                output.append("COMMIT_FILES_END")
+            
+            if commit.get('stats'):
+                output.append("COMMIT_STATS_START")
+                output.append(commit['stats'])
+                output.append("COMMIT_STATS_END")
+            
+            if commit.get('diff'):
+                output.append("COMMIT_DIFF_START")
+                output.append(commit['diff'])
+                output.append("COMMIT_DIFF_END")
+            
+            output.append(f"COMMIT_END|{commit['hash']}")
+            output.append("")
+        
+        output.append("COMMITS_END")
+    
+    return "\n".join(output)
 
 # ---------------------------------------------------------
 # CLI INTERFACE
@@ -279,7 +851,15 @@ def main():
         return 1
     
     # Determine mode: interactive or command-line
-    if args.interactive or (not any(vars(args).values()) or all(v is None or v is False for v in vars(args).values() if not isinstance(v, str))):
+    # Check if any flags were passed (excluding defaults)
+    has_flags = any([
+        args.all, args.repo_info, args.contributors, args.branches,
+        args.tags, args.commits, args.commit_stats, args.commit_files,
+        args.commit_diffs, args.prs, args.pr_reviews, args.pr_comments,
+        args.issues, args.limit, args.human_only, args.ai_only
+    ])
+    
+    if args.interactive or not has_flags:
         # Interactive mode
         config = interactive_menu()
         if not config:
@@ -348,7 +928,7 @@ def main():
         print(f"   ✅ Processed {len(commits)} commits" + " " * 20)
     
     # GitHub API data
-    if GITHUB_TOKEN and data.get('repo_info'):
+    if HAS_REQUESTS and GITHUB_TOKEN and data.get('repo_info'):
         owner = data['repo_info']['owner']
         repo = data['repo_info']['repo']
         
